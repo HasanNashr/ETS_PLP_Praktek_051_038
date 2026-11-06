@@ -89,9 +89,11 @@ class Parser:
 
     def _synchronize(self) -> None:
         # Panic mode (Crafting Interpreters bab 6): buang token sampai
-        # titik aman, lalu lanjutkan parsing.
+        # dan termasuk ';' berikutnya, lalu lanjutkan parsing.
         while not self._at_end():
-            self._advance()
+            tok = self._advance()
+            if tok.type == T.SEMICOLON:
+                return
 
     def _statement(self):
         if self._check_kw("SELECT"):
@@ -176,6 +178,7 @@ class Parser:
             kind = "INNER"
         elif self._match_kw("LEFT"):
             kind = "LEFT"
+            self._match_kw("OUTER")
         self._expect_kw("JOIN")
         source = self._table_ref()
         self._expect_kw("ON")
