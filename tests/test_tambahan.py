@@ -70,6 +70,17 @@ def test_regresi_b3_operator_not_equal():
     assert len(ops) == 1
     assert ops[0].value == "<>"
 
+
+# --- Bug B4: Parser AND/OR di level precedence yang sama ---
+# Sebelum fix: a = 1 OR b = 2 AND c = 3 diparsing sebagai (a=1 OR b=2) AND c=3.
+# Spesifikasi §3.1: AND memiliki precedence lebih tinggi dari OR.
+def test_regresi_b4_precedence_and_or():
+    s = one("SELECT id FROM t WHERE a = 1 OR b = 2 AND c = 3")
+    # Harus: a=1 OR (b=2 AND c=3)
+    assert s.where.op == "OR"
+    assert s.where.right.op == "AND"
+
+
 # --- Bug B5: Parser _synchronize() membuang semua token sampai EOF ---
 # Sebelum fix: setelah error, SEMUA statement berikutnya hilang.
 # Spesifikasi §6: error recovery buang sampai ';', lalu lanjutkan.
@@ -88,3 +99,117 @@ def test_regresi_b6_left_outer_join():
     s = one("SELECT a.id FROM a LEFT OUTER JOIN b ON b.a_id = a.id")
     assert s.joins[0].kind == "LEFT"
     assert s.joins[0].source.name == "b"
+
+
+# --- Bug B7: Resolver _delete() tidak memanggil _pop() ---
+# Sebelum fix: scope bocor, alias dari DELETE terlihat oleh statement berikutnya.
+# Spesifikasi §4.5: setiap statement berdiri sendiri, tidak ada scope tersisa.
+def test_regresi_b7_delete_scope_bocor():
+    script, diags = resolve(
+        "DELETE FROM sesi s WHERE s.id = 1;"
+        "SELECT p.nama FROM pelanggan p"
+    )
+    # Alias 's' dari DELETE tidak boleh terlihat di SELECT berikutnya
+    errors = [d for d in diags if d.level == "error"]
+    assert errors == []
+
+
+# --- Bug B8: Resolver _lookup() urutan pencarian terbalik ---
+# Sebelum fix: pencarian scope dari luar ke dalam, sehingga shadowing tidak bekerja.
+# Spesifikasi §4.3: pencarian dari scope terdalam ke luar.
+def test_regresi_b8_shadowing_subquery():
+    script, diags = resolve(
+        "SELECT x.id FROM pelanggan x "
+        "WHERE x.id IN (SELECT x.pelanggan_id FROM pesanan x WHERE x.total > 500000)"
+    )
+    # x di subquery harus resolve ke pesanan (shadowing), bukan pelanggan
+    inner_cols = [c for c in columns(script) if c.qualifier == "x" and c.name == "total"]
+    assert len(inner_cols) == 1
+    assert inner_cols[0].resolved == "pesanan"
+
+
+# --- Bug B9: Analyzer UPDATE subquery diberi op "U" alih-alih "R" ---
+# Sebelum fix: tabel di subquery WHERE/SET pada UPDATE ditandai "U".
+# Spesifikasi §5: subquery selalu R.
+def test_regresi_b9_update_subquery_operasi_read():
+    result = crud(
+        "UPDATE pelanggan SET level = 'gold' "
+        "WHERE id IN (SELECT pelanggan_id FROM pesanan WHERE total > 1000000)"
+    )
+    assert result["pelanggan"] == {"U"}
+    assert result["pesanan"] == {"R"}
+
+
+# --- TODO T1: INSERT INTO ... SELECT ---
+def test_regresi_t1_insert_select():
+    s = one("INSERT INTO arsip (id, total) SELECT id, total FROM pesanan WHERE tanggal < :batas")
+    assert isinstance(s, ast.Insert)
+    assert s.columns == ["id", "total"]
+    assert isinstance(s.query, ast.Select)
+    assert s.query.sources[0].name == "pesanan"
+
+
+# --- TODO T2: Kolom tanpa qualifier di-resolve ---
+def test_regresi_t2_kolom_tanpa_qualifier():
+    script, diags = resolve("SELECT nama, aktif FROM pelanggan WHERE id = 1")
+    cols = columns(script)
+    assert all(c.resolved == "pelanggan" for c in cols)
+    assert diags == []
+
+
+# --- TODO T3: Komentar blok /* ... */ ---
+def test_regresi_t3_komentar_blok():
+    toks = tokenize("/* komentar\n   multi baris */ SELECT id")
+    assert toks[0].type == T.KEYWORD
+    assert toks[0].value == "SELECT"
+    assert toks[0].line == 2
+
+
+# =====================================================================
+# BAGIAN 2: LIMA TEST KASUS TEPI
+# =====================================================================
+
+# Kasus tepi 1: Komentar blok yang mengandung '*' di dalamnya.
+# Berisiko karena '*' bisa salah dibaca sebagai awal dari '*/' penutup.
+def test_edge_komentar_blok_dengan_bintang():
+    toks = tokenize("/* harga * qty */ SELECT id FROM t")
+    non_eof = [t for t in toks if t.type != T.EOF]
+    assert non_eof[0].value == "SELECT"
+
+
+# Kasus tepi 2: Komentar blok yang tidak ditutup harus error.
+# Berisiko karena tanpa validasi, lexer bisa loop tak terbatas.
+def test_edge_komentar_blok_tidak_ditutup():
+    with pytest.raises(LexError) as info:
+        tokenize("/* komentar tanpa tutup")
+    assert "tidak ditutup" in str(info.value)
+
+
+# Kasus tepi 3: String dengan banyak escaped quote berturut-turut.
+# Berisiko karena '' harus dibedakan dari ' penutup.
+def test_edge_string_multi_escape():
+    toks = tokenize("'a''''b'")
+    # a + '' + '' + b = a''b
+    assert toks[0].type == T.STRING
+    assert toks[0].value == "a''b"
+
+
+# Kasus tepi 4: BETWEEN ... AND ... di dalam AND logika.
+# Berisiko karena AND milik BETWEEN harus dibedakan dari AND logika.
+def test_edge_between_and_logika():
+    s = one("SELECT id FROM t WHERE x BETWEEN 1 AND 10 AND y = 5")
+    # Harus: (x BETWEEN 1 AND 10) AND (y = 5)
+    assert isinstance(s.where, ast.BinaryOp) and s.where.op == "AND"
+    assert isinstance(s.where.left, ast.Between)
+    assert isinstance(s.where.right, ast.BinaryOp) and s.where.right.op == "="
+
+
+# Kasus tepi 5: Kolom tanpa qualifier dengan beberapa tabel → ambigu.
+# Berisiko karena resolver harus memilih warning, bukan crash.
+def test_edge_kolom_ambigu_multi_tabel():
+    script, diags = resolve("SELECT nama FROM pelanggan, pesanan WHERE aktif = 1")
+    warnings = [d for d in diags if d.level == "warning"]
+    assert any("ambigu" in w.message for w in warnings)
+    # resolved harus None karena ambigu
+    cols = columns(script)
+    assert all(c.resolved is None for c in cols)
